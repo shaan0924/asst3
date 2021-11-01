@@ -681,6 +681,11 @@ CudaRenderer::render() {
     dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x,
         (image->height + blockDim.y - 1) / blockDim.y);
 
+    int numBlocks = ((image->width + blockDim.x - 1)/ blockDim.x)
+        * ((image->height + blockDim.y - 1)/ blockDim.y);
+    
+    
+
     allPixels<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
 }
