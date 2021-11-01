@@ -40,6 +40,19 @@ struct GlobalConstants {
 // place to put read-only variables).
 __constant__ GlobalConstants cuConstRendererParams;
 
+__constant__ std::vector<int*> blockCircleCounts;
+
+static inline int nextPow2(int n) {
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
+
 // read-only lookup tables used to quickly compute noise (needed by
 // advanceAnimation for the snowflake scene)
 __constant__ int    cuConstNoiseYPermutationTable[256];
@@ -684,7 +697,26 @@ CudaRenderer::render() {
     int numBlocks = ((image->width + blockDim.x - 1)/ blockDim.x)
         * ((image->height + blockDim.y - 1)/ blockDim.y);
     
-    
+    std::vector<int*>
+    int circlepow = nextPow2(numCircles);
+    const int circleBlocks = (numCircles + 256 - 1)/256;
+    int* flags = nullptr;
+    int* scan = nullptr;
+    int* output = nullptr;
+    cudaMalloc(&flags, numCircles*sizeof(int));
+    cudaMalloc(&scan, circlepow*sizeof(int));
+    cudaMalloc(&output, numCircles*sizeof(int));
+    for(int i = 0; i < numBlocks; i++) {
+        repflags<<<circleBlocks, 256>>>(flags, scan);
+
+        //exclusive scan(scan, circlepow)
+
+        getcircles<<<circleBlocks, 256>>>(scan, flags, output);
+
+        int* insides = new int[numCircles];
+        cudaMemcpy(insides, output, numCircles*sizeof(int), cudaMemcpyDeviceToHost);
+        blockCircleCounts.push_back(insides);
+    }
 
     allPixels<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
