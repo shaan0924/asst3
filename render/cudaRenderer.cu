@@ -14,6 +14,9 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
+#include "exclusiveScan.cu_inl"
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -451,6 +454,10 @@ __global__ void allPixels() {
     int pixelX = (blockIdx.x % blocksPerRow)* blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
+    //int blockind = blocksPerRow * blockIdx.y + blockIdx.x;
+
+    //int* circsinblock = blockCircleCounts[blockind];
+
     if(pixelX > imageWidth || pixelY > imageHeight) {
         return;
     }
@@ -460,7 +467,9 @@ __global__ void allPixels() {
     imgPtr += pixelX;
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+    //for(int i = 0; i < cuConstRendererParams.numCircles; i++) {
     for(int index = 0; index < cuConstRendererParams.numCircles; index++) {
+        //int index = circsinblock[i];
         int index3 = 3 * index;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
         float  rad = cuConstRendererParams.radius[index];
@@ -697,7 +706,7 @@ CudaRenderer::render() {
     int numBlocks = ((image->width + blockDim.x - 1)/ blockDim.x)
         * ((image->height + blockDim.y - 1)/ blockDim.y);
     
-    std::vector<int*>
+    std::vector<int*> bcircles;
     int circlepow = nextPow2(numCircles);
     const int circleBlocks = (numCircles + 256 - 1)/256;
     int* flags = nullptr;
@@ -715,8 +724,14 @@ CudaRenderer::render() {
 
         int* insides = new int[numCircles];
         cudaMemcpy(insides, output, numCircles*sizeof(int), cudaMemcpyDeviceToHost);
-        blockCircleCounts.push_back(insides);
+        bcircles.push_back(insides);
     }
+
+    cudaMemcpyToSymbol(blockCircleCounts, &bcircles, sizeof(std::vector<int*>));
+
+    cudaFree(flags);
+    cudaFree(scan);
+    cudaFree(output);
 
     allPixels<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
