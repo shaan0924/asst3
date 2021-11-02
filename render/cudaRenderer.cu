@@ -458,6 +458,8 @@ __global__ void allPixels() {
 
     //int* circsinblock = blockCircleCounts[blockind];
 
+    //int numblockCircles = sizeof(circsinblock)/sizeof(circsinblock[0]);
+
     if(pixelX > imageWidth || pixelY > imageHeight) {
         return;
     }
@@ -467,7 +469,7 @@ __global__ void allPixels() {
     imgPtr += pixelX;
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
-    //for(int i = 0; i < cuConstRendererParams.numCircles; i++) {
+    //for(int i = 0; i < numblockCircles; i++) {
     for(int index = 0; index < cuConstRendererParams.numCircles; index++) {
         //int index = circsinblock[i];
         int index3 = 3 * index;
@@ -488,7 +490,58 @@ __global__ void allPixels() {
     }
 }
 
+__global__ void
+repflags(int* flags, int* scan, int length, int chunkId) {
+    int index = (blockIdx.x * blockDim.x + threadIdx.x);
 
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    int chunksperRow = (imageWidth + 16 - 1)/16;
+    int chunkXmin = (chunkId % chunksperRow) * 16;
+    int currentRow = chunkId / chunksperRow;
+    int chunkYmin = currentRow * 16;
+
+    if(index >= cuConstRendererParams.numCircles)
+        return;
+
+    int index3 = 3 * index;
+    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    float  rad = cuConstRendererParams.radius[index];
+
+    int distanceX = abs(p.x - (chunkXmin + 8));
+    int distanceY = abs(p.y - (chunkYmin + 8));
+
+    if((distanceX > (rad + 8)) || (distanceY > (rad + 8))) {
+        flags[index] = 0;
+        scan[index] = flags[index];
+        return;
+    }
+    if(distanceX <= 8 || distanceY <= 8) {
+        flags[index] = 1;
+        scan[index] = flags[index];
+        return;
+    }
+
+    int corner = (distanceX - 8)^2 + (distanceY - 8)^2;
+    if(corner <= rad^2) {
+        flags[index] = 1;
+    } else {
+        flags[index] = 0;
+    }
+
+    scan[index] = flags[index];
+}
+
+__global__ void
+getcircles(int* scan, int* flags, int* output, int length) {
+    int index = (blockIdx.x * blockDim.x + threadIdx.x);
+    if(index >= length)
+        return;
+    if(flags[index] == 1) {
+        output[scan[index]] = index;
+    }
+}
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -716,7 +769,7 @@ CudaRenderer::render() {
     cudaMalloc(&scan, circlepow*sizeof(int));
     cudaMalloc(&output, numCircles*sizeof(int));
     for(int i = 0; i < numBlocks; i++) {
-        repflags<<<circleBlocks, 256>>>(flags, scan);
+        repflags<<<circleBlocks, 256>>>(flags, scan, numCircles, i);
 
         //exclusive scan(scan, circlepow)
 
