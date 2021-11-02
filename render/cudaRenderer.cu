@@ -34,6 +34,7 @@ struct GlobalConstants {
     int imageWidth;
     int imageHeight;
     float* imageData;
+
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -42,8 +43,6 @@ struct GlobalConstants {
 // about this type of memory in class, but constant memory is a fast
 // place to put read-only variables).
 __constant__ GlobalConstants cuConstRendererParams;
-
-__constant__ std::vector<int*> blockCircleCounts;
 
 static inline int nextPow2(int n) {
     n--;
@@ -495,7 +494,6 @@ repflags(int* flags, int* scan, int length, int chunkId) {
     int index = (blockIdx.x * blockDim.x + threadIdx.x);
 
     short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
 
     int chunksperRow = (imageWidth + 16 - 1)/16;
     int chunkXmin = (chunkId % chunksperRow) * 16;
@@ -541,6 +539,19 @@ getcircles(int* scan, int* flags, int* output, int length) {
     if(flags[index] == 1) {
         output[scan[index]] = index;
     }
+}
+
+__global__ void
+exclusive_scan(int* scan, int circlepow) {
+    BLOCKSIZE = circlepow;
+    int linearThreadIndex =  threadIdx.y * blockDim.x + threadIdx.x;
+
+    __shared__ uint prefixSumInput[BLOCKSIZE] = scan;
+    __shared__ uint prefixSumOutput[BLOCKSIZE];
+    __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
+    sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
+    scan = prefixSumOutput;
+
 }
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -771,16 +782,16 @@ CudaRenderer::render() {
     for(int i = 0; i < numBlocks; i++) {
         repflags<<<circleBlocks, 256>>>(flags, scan, numCircles, i);
 
-        //exclusive scan(scan, circlepow)
+        exclusive_scan<<<circleBlocks, 256>>>(scan, circlepow);
 
-        getcircles<<<circleBlocks, 256>>>(scan, flags, output);
+
+        getcircles<<<circleBlocks, 256>>>(scan, flags, output, numCircles);
 
         int* insides = new int[numCircles];
         cudaMemcpy(insides, output, numCircles*sizeof(int), cudaMemcpyDeviceToHost);
         bcircles.push_back(insides);
     }
 
-    cudaMemcpyToSymbol(blockCircleCounts, &bcircles, sizeof(std::vector<int*>));
 
     cudaFree(flags);
     cudaFree(scan);
