@@ -14,6 +14,7 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define BLOCKSIZE 256
 #define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
 #include "exclusiveScan.cu_inl"
 
@@ -490,8 +491,13 @@ __global__ void allPixels() {
 }
 
 __global__ void
-repflags(int* flags, int* scan, int length, int chunkId) {
+findcircles(int* output, int chunkId) {
+    __shared__ uint flags[BLOCKSIZE];
+    __shared__ uint prefixSumOutput[BLOCKSIZE];
+    __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
+
     int index = (blockIdx.x * blockDim.x + threadIdx.x);
+    int linearThreadIndex =  threadIdx.y * blockDim.x + threadIdx.x;
 
     short imageWidth = cuConstRendererParams.imageWidth;
 
@@ -511,48 +517,26 @@ repflags(int* flags, int* scan, int length, int chunkId) {
     int distanceY = abs(p.y - (chunkYmin + 8));
 
     if((distanceX > (rad + 8)) || (distanceY > (rad + 8))) {
-        flags[index] = 0;
-        scan[index] = flags[index];
-        return;
+        flags[linearThreadIndex] = 0;
     }
     if(distanceX <= 8 || distanceY <= 8) {
-        flags[index] = 1;
-        scan[index] = flags[index];
-        return;
+        flags[linearThreadIndex] = 1;
     }
 
     int corner = (distanceX - 8)^2 + (distanceY - 8)^2;
     if(corner <= rad^2) {
-        flags[index] = 1;
+        flags[linearThreadIndex] = 1;
     } else {
-        flags[index] = 0;
+        flags[linearThreadIndex] = 0;
     }
 
-    scan[index] = flags[index];
-}
+    sharedMemExclusiveScan(linearThreadIndex, flags, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
 
-__global__ void
-getcircles(int* scan, int* flags, int* output, int length) {
-    int index = (blockIdx.x * blockDim.x + threadIdx.x);
-    if(index >= length)
-        return;
-    if(flags[index] == 1) {
-        output[scan[index]] = index;
+    if(flags[linearThreadIndex] == 1) {
+        //add to main array
     }
 }
 
-__global__ void
-exclusive_scan(int* scan, int circlepow) {
-    BLOCKSIZE = circlepow;
-    int linearThreadIndex =  threadIdx.y * blockDim.x + threadIdx.x;
-
-    __shared__ uint prefixSumInput[BLOCKSIZE] = scan;
-    __shared__ uint prefixSumOutput[BLOCKSIZE];
-    __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
-    sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
-    scan = prefixSumOutput;
-
-}
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -773,28 +757,15 @@ CudaRenderer::render() {
     std::vector<int*> bcircles;
     int circlepow = nextPow2(numCircles);
     const int circleBlocks = (numCircles + 256 - 1)/256;
-    int* flags = nullptr;
-    int* scan = nullptr;
     int* output = nullptr;
-    cudaMalloc(&flags, numCircles*sizeof(int));
-    cudaMalloc(&scan, circlepow*sizeof(int));
     cudaMalloc(&output, numCircles*sizeof(int));
     for(int i = 0; i < numBlocks; i++) {
-        repflags<<<circleBlocks, 256>>>(flags, scan, numCircles, i);
-
-        exclusive_scan<<<circleBlocks, 256>>>(scan, circlepow);
-
-
-        getcircles<<<circleBlocks, 256>>>(scan, flags, output, numCircles);
+        findcircles<<<circleBlocks, 256>>>(output, i);
 
         int* insides = new int[numCircles];
         cudaMemcpy(insides, output, numCircles*sizeof(int), cudaMemcpyDeviceToHost);
         bcircles.push_back(insides);
     }
-
-
-    cudaFree(flags);
-    cudaFree(scan);
     cudaFree(output);
 
     allPixels<<<gridDim, blockDim>>>();
