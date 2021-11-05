@@ -17,6 +17,7 @@
 #define BLOCKSIZE 256
 #define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
 #include "exclusiveScan.cu_inl"
+#include "circleBoxTest.cu_inl"
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -44,17 +45,6 @@ struct GlobalConstants {
 // about this type of memory in class, but constant memory is a fast
 // place to put read-only variables).
 __constant__ GlobalConstants cuConstRendererParams;
-
-static inline int nextPow2(int n) {
-    n--;
-    n |= n >> 1;
-    n |= n >> 2;
-    n |= n >> 4;
-    n |= n >> 8;
-    n |= n >> 16;
-    n++;
-    return n;
-}
 
 // read-only lookup tables used to quickly compute noise (needed by
 // advanceAnimation for the snowflake scene)
@@ -451,27 +441,18 @@ __global__ void allPixels() {
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
     int blocksPerRow = imageWidth / blockDim.x;
-    int pixelX = (blockIdx.x % blocksPerRow)* blockDim.x + threadIdx.x;
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
-
-    //int blockind = blocksPerRow * blockIdx.y + blockIdx.x;
-
-    //int* circsinblock = blockCircleCounts[blockind];
-
-    //int numblockCircles = sizeof(circsinblock)/sizeof(circsinblock[0]);
 
     if(pixelX > imageWidth || pixelY > imageHeight) {
         return;
     }
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth)]);
-    imgPtr += pixelX;
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
-    //for(int i = 0; i < numblockCircles; i++) {
     for(int index = 0; index < cuConstRendererParams.numCircles; index++) {
-        //int index = circsinblock[i];
         int index3 = 3 * index;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
         float  rad = cuConstRendererParams.radius[index];
@@ -491,50 +472,80 @@ __global__ void allPixels() {
 }
 
 __global__ void
-findcircles(int* output, int chunkId) {
-    __shared__ uint flags[BLOCKSIZE];
-    __shared__ uint prefixSumOutput[BLOCKSIZE];
-    __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
-
-    int index = (blockIdx.x * blockDim.x + threadIdx.x);
+findcircles() {
     int linearThreadIndex =  threadIdx.y * blockDim.x + threadIdx.x;
-
     short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
-    int chunksperRow = (imageWidth + 16 - 1)/16;
-    int chunkXmin = (chunkId % chunksperRow) * 16;
-    int currentRow = chunkId / chunksperRow;
-    int chunkYmin = currentRow * 16;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth)]);
+    imgPtr+= pixelX;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                        invHeight * (static_cast<float>(pixelY) + 0.5f));
+    
 
-    if(index >= cuConstRendererParams.numCircles)
-        return;
+    for(int index = linearThreadIndex; index < cuConstRendererParams.numCircles + 256; index+=256) {
+        int circlecount = 0;
+        __shared__ uint flags[BLOCKSIZE];
+        __shared__ uint prefixSumOutput[BLOCKSIZE];
+        __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
+        __shared__ uint output[BLOCKSIZE];
 
-    int index3 = 3 * index;
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
+        if(index > cuConstRendererParams.numCircles)
+            continue;
 
-    int distanceX = abs(p.x - (chunkXmin + 8));
-    int distanceY = abs(p.y - (chunkYmin + 8));
+        int index3 = 3 * index;
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        float  rad = cuConstRendererParams.radius[index];
 
-    if((distanceX > (rad + 8)) || (distanceY > (rad + 8))) {
-        flags[linearThreadIndex] = 0;
+        int boxL = blockIdx.x * 16;
+        int boxR = boxL + 16;
+        int boxB = blockIdx.y * 16;
+        int boxT = boxB + 16;
+
+        flags[linearThreadIndex] = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+
+        __syncthreads();
+        
+        sharedMemExclusiveScan(linearThreadIndex, flags, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
+
+        if(flags[linearThreadIndex] == 1) {
+            output[prefixSumOutput[linearThreadIndex]] = index;
+            circlecount++;
+        }
+
+        __syncthreads();
+
+
+        for(int j = 0; j < circlecount; j++) {
+            if(pixelX > imageWidth || pixelY > imageHeight)
+                continue;
+            int cInd = output[j];
+            int cInd3 = 3 * cInd;
+            float3 cp = *(float3*)(&cuConstRendererParams.position[cInd3]);
+            float  crad = cuConstRendererParams.radius[cInd];
+            short minX = static_cast<short>(imageWidth * (cp.x - crad));
+            short maxX = static_cast<short>(imageWidth * (cp.x + crad)) + 1;
+            short minY = static_cast<short>(imageHeight * (cp.y - crad));
+            short maxY = static_cast<short>(imageHeight * (cp.y + crad)) + 1;
+            short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+            short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+            short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+            short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+            if(pixelX >= screenMinX && pixelX < screenMaxX && pixelY >= screenMinY && pixelY < screenMaxY)
+                shadePixel(cInd, pixelCenterNorm, cp, imgPtr);
+        }
+
+        __syncthreads();
+
     }
-    if(distanceX <= 8 || distanceY <= 8) {
-        flags[linearThreadIndex] = 1;
-    }
 
-    int corner = (distanceX - 8)^2 + (distanceY - 8)^2;
-    if(corner <= rad^2) {
-        flags[linearThreadIndex] = 1;
-    } else {
-        flags[linearThreadIndex] = 0;
-    }
-
-    sharedMemExclusiveScan(linearThreadIndex, flags, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
-
-    if(flags[linearThreadIndex] == 1) {
-        //add to main array
-    }
+    //have number of threads in total equal to total pixels, in the kernel
+    //have each thread in each block do a set of exclusive scans for each 256
+    //circles
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -750,24 +761,8 @@ CudaRenderer::render() {
     dim3 blockDim(16, 16);
     dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x,
         (image->height + blockDim.y - 1) / blockDim.y);
-
-    int numBlocks = ((image->width + blockDim.x - 1)/ blockDim.x)
-        * ((image->height + blockDim.y - 1)/ blockDim.y);
     
-    std::vector<int*> bcircles;
-    int circlepow = nextPow2(numCircles);
-    const int circleBlocks = (numCircles + 256 - 1)/256;
-    int* output = nullptr;
-    cudaMalloc(&output, numCircles*sizeof(int));
-    for(int i = 0; i < numBlocks; i++) {
-        findcircles<<<circleBlocks, 256>>>(output, i);
-
-        int* insides = new int[numCircles];
-        cudaMemcpy(insides, output, numCircles*sizeof(int), cudaMemcpyDeviceToHost);
-        bcircles.push_back(insides);
-    }
-    cudaFree(output);
 
     allPixels<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    cudaDeviceSynchronize();    
 }
